@@ -1,0 +1,10 @@
+/target
+
+# Print jobs and exports written at runtime
+*.prn
+*.zpl
+*.epl
+label_project.json
+
+# Local test screenshots
+/shots
