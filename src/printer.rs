@@ -1,8 +1,15 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
+
+use crate::barcode::{bar_dots, generate_code128, generate_code39, generate_qr_matrix, is_code39_char, qr_scale};
+use crate::model::{along_across, BarcodeType, ElementData, Label, ShapeKind};
+
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PrinterLanguage {
@@ -178,145 +185,352 @@ pub fn detect_usb_printers() -> Vec<UsbPrinter> {
                     device_node: actual_dev,
                     cups_queue: matched_queue,
                     is_zebra,
-                    status: "Ready".to_string(),
+                    status: "Detected".to_string(),
                 });
             }
         }
     }
 
+    // Under CUPS the usblp driver is often unbound, so the queue address is the only record
     if printers.is_empty() {
         for (queue, uri) in &cups_queues {
-            if uri.starts_with("usb://") {
+            if let Some((manufacturer, model, serial)) = parse_usb_uri(uri) {
+                let is_zebra = manufacturer.to_lowercase().contains("zebra");
                 printers.push(UsbPrinter {
-                    name: format!("Zebra {}", queue),
-                    manufacturer: "Zebra Technologies".to_string(),
-                    model: queue.clone(),
-                    serial: "".to_string(),
-                    vendor_id: "0a5f".to_string(),
-                    product_id: "000a".to_string(),
+                    name: format!("{} {}", manufacturer, model),
+                    manufacturer,
+                    model,
+                    serial,
+                    vendor_id: String::new(),
+                    product_id: String::new(),
                     device_node: "/dev/usb/lp0".to_string(),
                     cups_queue: Some(queue.clone()),
-                    is_zebra: true,
-                    status: "Ready".to_string(),
+                    is_zebra,
+                    status: "Detected".to_string(),
                 });
             }
         }
     }
 
     if printers.is_empty() && Path::new("/dev/usb/lp0").exists() {
-        let default_cups = cups_queues.first().map(|(q, _)| q.clone());
         printers.push(UsbPrinter {
-            name: "Zebra Technologies TLP2844".to_string(),
-            manufacturer: "Zebra Technologies".to_string(),
-            model: "TLP2844".to_string(),
-            serial: "41A063801083".to_string(),
-            vendor_id: "0a5f".to_string(),
-            product_id: "000a".to_string(),
+            name: "USB Printer".to_string(),
+            manufacturer: "Generic".to_string(),
+            model: "USB Printer".to_string(),
+            serial: String::new(),
+            vendor_id: String::new(),
+            product_id: String::new(),
             device_node: "/dev/usb/lp0".to_string(),
-            cups_queue: default_cups.or_else(|| Some("TLP2844".to_string())),
-            is_zebra: true,
-            status: "Ready".to_string(),
+            cups_queue: None,
+            is_zebra: false,
+            status: "Detected".to_string(),
         });
     }
 
+    printers.sort_by_key(|p| !p.is_zebra);
     printers
+}
+
+/// Reads manufacturer, model and serial from a CUPS address like
+/// `usb://Zebra/TLP2844?serial=ABC123`.
+fn parse_usb_uri(uri: &str) -> Option<(String, String, String)> {
+    let rest = uri.strip_prefix("usb://")?;
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let (manufacturer, model) = path.split_once('/')?;
+    let serial = query
+        .split('&')
+        .find_map(|part| part.strip_prefix("serial="))
+        .unwrap_or("");
+    let decode = |text: &str| text.replace("%20", " ");
+    Some((decode(manufacturer), decode(model), serial.to_string()))
+}
+
+/// Whether a job uses EPL2. Network printers have no model to detect, so Auto means ZPL.
+pub fn resolve_use_epl(lang_pref: PrinterLanguage, printer: Option<&UsbPrinter>) -> bool {
+    match lang_pref {
+        PrinterLanguage::Epl2 => true,
+        PrinterLanguage::Zpl2 => false,
+        PrinterLanguage::Auto => printer.map_or(false, UsbPrinter::supports_epl),
+    }
+}
+
+/// Refuses labels that would print wrong and returns notes about anything the
+/// printer can only approximate.
+pub fn check_label(label: &Label, use_epl: bool) -> Result<Vec<String>, String> {
+    let dpmm = label.resolution.dots_per_mm();
+    let mut notes = Vec::new();
+
+    for el in &label.elements {
+        let w = (el.width * dpmm).round().max(1.0) as u32;
+        let h = (el.height * dpmm).round().max(1.0) as u32;
+        match &el.data {
+            ElementData::Barcode { barcode_type, data, .. } => {
+                if data.is_empty() {
+                    return Err(format!("\"{}\" has no barcode data.", el.name));
+                }
+                let (along, _) = along_across(el.rotation, w, h);
+                match barcode_type {
+                    BarcodeType::Code128 => {
+                        if !data.bytes().all(|b| (32..=126).contains(&b)) {
+                            return Err(format!("\"{}\": Code 128 only accepts plain ASCII text.", el.name));
+                        }
+                        note_if_too_wide(&mut notes, &el.name, generate_code128(data).modules.len(), along);
+                    }
+                    BarcodeType::Code39 => {
+                        if !data.trim_matches('*').chars().all(is_code39_char) {
+                            return Err(format!("\"{}\": Code 39 only accepts A-Z, 0-9 and - . $ / + % space.", el.name));
+                        }
+                        note_if_too_wide(&mut notes, &el.name, generate_code39(data).modules.len(), along);
+                    }
+                    BarcodeType::QrCode => {
+                        if generate_qr_matrix(data).is_none() {
+                            return Err(format!("\"{}\": too much data for a QR code.", el.name));
+                        }
+                        if qr_scale(data, w.min(h)) < 2 {
+                            notes.push(format!("\"{}\": QR code may be too small to scan.", el.name));
+                        }
+                        if el.rotation != 0 {
+                            notes.push(format!("\"{}\": QR codes print unrotated.", el.name));
+                        }
+                    }
+                    other => {
+                        return Err(format!("\"{}\": {} printing is not supported yet.", el.name, other.name()));
+                    }
+                }
+            }
+            ElementData::Shape { kind: ShapeKind::RoundedRectangle | ShapeKind::Ellipse, .. } if use_epl => {
+                notes.push(format!("\"{}\": EPL2 prints this shape as a plain box.", el.name));
+            }
+            ElementData::Text { italic: true, .. } => {
+                notes.push(format!("\"{}\": italic text prints upright.", el.name));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(notes)
+}
+
+fn note_if_too_wide(notes: &mut Vec<String>, name: &str, module_count: usize, along_dots: u32) {
+    if module_count as u32 * bar_dots(module_count, along_dots) > along_dots {
+        notes.push(format!("\"{}\": barcode is wider than its box.", name));
+    }
+}
+
+fn job_data(label: &Label, copies: u32, use_epl: bool) -> String {
+    if use_epl {
+        crate::epl::generate_epl(label, copies)
+    } else {
+        crate::zpl::generate_zpl(label, copies)
+    }
+}
+
+fn protocol_name(use_epl: bool) -> &'static str {
+    if use_epl {
+        "EPL2"
+    } else {
+        "ZPL II"
+    }
+}
+
+fn with_notes(message: String, notes: &[String]) -> String {
+    if notes.is_empty() {
+        message
+    } else {
+        format!("{} Note: {}", message, notes.join(" "))
+    }
 }
 
 pub fn print_to_usb(
     printer: &UsbPrinter,
-    label: &crate::model::Label,
+    label: &mut Label,
     copies: u32,
     lang_pref: PrinterLanguage,
 ) -> Result<String, String> {
-    let use_epl = match lang_pref {
-        PrinterLanguage::Epl2 => true,
-        PrinterLanguage::Zpl2 => false,
-        PrinterLanguage::Auto => printer.supports_epl(),
-    };
+    let copies = copies.max(1);
+    let use_epl = resolve_use_epl(lang_pref, Some(printer));
+    let notes = check_label(label, use_epl)?;
+    let print_data = job_data(label, copies, use_epl);
+    let protocol = protocol_name(use_epl);
 
-    let print_data = if use_epl {
-        crate::epl::generate_epl(label, copies)
-    } else {
-        crate::zpl::generate_zpl(label)
-    };
-
-    let protocol_name = if use_epl { "EPL2" } else { "ZPL II" };
-
-    let tmp_path = std::env::temp_dir().join(format!("zebra_label_{}.prn", std::process::id()));
-    if let Err(e) = fs::write(&tmp_path, &print_data) {
-        return Err(format!("Failed to write temporary print file: {}", e));
-    }
-
-    let _ = fs::write("last_usb_print.prn", &print_data);
+    let mut failures = Vec::new();
 
     // Method A: If CUPS queue is available, print raw
     if let Some(ref queue) = printer.cups_queue {
-        let output = Command::new("lp")
-            .arg("-d")
-            .arg(queue)
-            .arg("-n")
-            .arg(copies.max(1).to_string())
-            .arg("-o")
-            .arg("raw")
-            .arg(&tmp_path)
-            .output();
-
-        if let Ok(out) = output {
-            if out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let _ = fs::remove_file(&tmp_path);
-                return Ok(format!(
-                    "Print job sent to {} via CUPS ({} protocol, {} copies): {}",
-                    queue, protocol_name, copies, stdout
-                ));
+        match send_to_cups(queue, &print_data) {
+            Ok(request) => {
+                label.advance_counters(copies);
+                let message = format!("Print job sent to {} via CUPS ({}, {} copies): {}", queue, protocol, copies, request);
+                return Ok(with_notes(message, &notes));
             }
-        }
-
-        let lpr_out = Command::new("lpr")
-            .arg("-P")
-            .arg(queue)
-            .arg(format!("-#{}", copies.max(1)))
-            .arg("-l")
-            .arg(&tmp_path)
-            .output();
-
-        if let Ok(out) = lpr_out {
-            if out.status.success() {
-                let _ = fs::remove_file(&tmp_path);
-                return Ok(format!(
-                    "Print job sent to {} via lpr ({} protocol, {} copies)",
-                    queue, protocol_name, copies
-                ));
-            }
+            Err(e) => failures.push(e),
         }
     }
 
     // Method B: Direct character device write
-    match fs::OpenOptions::new().write(true).open(&printer.device_node) {
-        Ok(mut file) => {
-            let mut err = None;
-            for _ in 0..copies.max(1) {
-                if let Err(e) = file.write_all(print_data.as_bytes()) {
-                    err = Some(e);
-                    break;
-                }
-            }
-            let _ = fs::remove_file(&tmp_path);
-            if let Some(e) = err {
-                Err(format!("Error writing to {}: {}", printer.device_node, e))
-            } else {
-                Ok(format!(
-                    "Direct print ({}): sent {} copies to {}",
-                    protocol_name, copies, printer.device_node
-                ))
-            }
+    match fs::OpenOptions::new()
+        .write(true)
+        .open(&printer.device_node)
+        .and_then(|mut file| file.write_all(print_data.as_bytes()))
+    {
+        Ok(()) => {
+            label.advance_counters(copies);
+            let message = format!("Direct print ({}): sent {} copies to {}", protocol, copies, printer.device_node);
+            Ok(with_notes(message, &notes))
         }
         Err(e) => {
-            let _ = fs::remove_file(&tmp_path);
-            Err(format!(
-                "Unable to send to {}: {}. Add user to 'lp' group or configure CUPS queue.",
-                printer.device_node, e
-            ))
+            failures.push(format!("{}: {}", printer.device_node, e));
+            Err(failures.join("; "))
         }
+    }
+}
+
+fn send_to_cups(queue: &str, print_data: &str) -> Result<String, String> {
+    let tmp_path = std::env::temp_dir().join(format!("zebra_label_{}.prn", std::process::id()));
+    fs::write(&tmp_path, print_data).map_err(|e| format!("Failed to write temporary print file: {}", e))?;
+
+    let output = Command::new("lp")
+        .arg("-d")
+        .arg(queue)
+        .arg("-o")
+        .arg("raw")
+        .arg(&tmp_path)
+        .output();
+    let _ = fs::remove_file(&tmp_path);
+
+    match output {
+        Ok(out) if out.status.success() => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        Ok(out) => Err(format!("lp: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        Err(e) => Err(format!("lp: {}", e)),
+    }
+}
+
+pub fn print_to_network(
+    host: &str,
+    port: u16,
+    label: &mut Label,
+    copies: u32,
+    lang_pref: PrinterLanguage,
+) -> Result<String, String> {
+    let copies = copies.max(1);
+    let use_epl = resolve_use_epl(lang_pref, None);
+    let notes = check_label(label, use_epl)?;
+    let print_data = job_data(label, copies, use_epl);
+
+    let address = (host.trim(), port)
+        .to_socket_addrs()
+        .map_err(|e| format!("Cannot resolve {}: {}", host, e))?
+        .next()
+        .ok_or_else(|| format!("Cannot resolve {}", host))?;
+
+    let mut stream = TcpStream::connect_timeout(&address, NETWORK_TIMEOUT)
+        .map_err(|e| format!("Cannot connect to {}: {}", address, e))?;
+    stream
+        .set_write_timeout(Some(NETWORK_TIMEOUT))
+        .map_err(|e| format!("Cannot configure connection to {}: {}", address, e))?;
+    stream
+        .write_all(print_data.as_bytes())
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("Error sending to {}: {}", address, e))?;
+
+    label.advance_counters(copies);
+    let message = format!("Print job sent to {} ({}, {} copies)", address, protocol_name(use_epl), copies);
+    Ok(with_notes(message, &notes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Element;
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    fn counter_label() -> Label {
+        let mut label = Label::new_empty(50.0, 25.0, "test");
+        label.elements.push(Element {
+            id: 1,
+            name: "serial".to_string(),
+            x: 1.0,
+            y: 1.0,
+            width: 40.0,
+            height: 5.0,
+            rotation: 0,
+            data: ElementData::Counter {
+                prefix: "SN-".to_string(),
+                current_value: 10,
+                step: 1,
+                padding_digits: 3,
+                font_size: 10.0,
+                bold: false,
+            },
+        });
+        label
+    }
+
+    fn barcode_label(barcode_type: BarcodeType, data: &str) -> Label {
+        let mut label = Label::new_empty(50.0, 25.0, "test");
+        label.elements.push(Element {
+            id: 1,
+            name: "code".to_string(),
+            x: 1.0,
+            y: 1.0,
+            width: 40.0,
+            height: 10.0,
+            rotation: 0,
+            data: ElementData::Barcode { barcode_type, data: data.to_string(), show_text: false, module_width: 0.4 },
+        });
+        label
+    }
+
+    #[test]
+    fn network_print_delivers_the_job_and_advances_counters() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let receiver = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = String::new();
+            stream.read_to_string(&mut received).unwrap();
+            received
+        });
+
+        let mut label = counter_label();
+        print_to_network("127.0.0.1", port, &mut label, 2, PrinterLanguage::Zpl2).unwrap();
+
+        let received = receiver.join().unwrap();
+        assert!(received.contains("SN-010") && received.contains("SN-011"), "{received}");
+        assert!(matches!(label.elements[0].data, ElementData::Counter { current_value: 12, .. }));
+    }
+
+    #[test]
+    fn failed_network_print_is_an_error_and_keeps_counters() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut label = counter_label();
+        assert!(print_to_network("127.0.0.1", port, &mut label, 2, PrinterLanguage::Zpl2).is_err());
+        assert!(matches!(label.elements[0].data, ElementData::Counter { current_value: 10, .. }));
+    }
+
+    #[test]
+    fn reads_printer_details_from_cups_address() {
+        let (manufacturer, model, serial) = parse_usb_uri("usb://Zebra/TLP2844?serial=ABC123").unwrap();
+        assert_eq!((manufacturer.as_str(), model.as_str(), serial.as_str()), ("Zebra", "TLP2844", "ABC123"));
+        assert!(parse_usb_uri("socket://192.0.2.1:9100").is_none());
+    }
+
+    #[test]
+    fn auto_language_uses_epl_only_for_known_models() {
+        assert!(!resolve_use_epl(PrinterLanguage::Auto, None));
+        assert!(resolve_use_epl(PrinterLanguage::Epl2, None));
+    }
+
+    #[test]
+    fn unsupported_or_invalid_barcodes_are_refused() {
+        assert!(check_label(&barcode_label(BarcodeType::Ean13, "123"), false).is_err());
+        assert!(check_label(&barcode_label(BarcodeType::Code39, "a_b"), false).is_err());
+        assert!(check_label(&barcode_label(BarcodeType::Code128, "caf\u{e9}"), false).is_err());
+        assert!(check_label(&barcode_label(BarcodeType::Code128, ""), false).is_err());
+        assert!(check_label(&barcode_label(BarcodeType::Code128, "OK-1"), false).is_ok());
     }
 }

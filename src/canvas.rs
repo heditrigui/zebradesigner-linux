@@ -1,6 +1,6 @@
-use crate::barcode::{generate_code128, generate_code39, generate_qr_matrix};
-use crate::model::{BarcodeType, ElementData, Label, ShapeKind};
-use eframe::egui::{self, Color32, Pos2, Rect, Stroke, Vec2};
+use crate::barcode::{bar_dots, bar_height_dots, generate_code128, generate_code39, generate_qr_matrix, qr_scale};
+use crate::model::{along_across, counter_text, format_datetime, BarcodeType, ElementData, Label, ShapeKind};
+use eframe::egui::{self, epaint::TextShape, Color32, Pos2, Rect, Shape, Stroke, Vec2};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DragMode {
@@ -20,6 +20,29 @@ pub enum ResizeCorner {
     Bottom,
     Left,
     Right,
+}
+
+/// Maps a position in an element's reading direction (u along, v across, in
+/// points) to the screen, starting from the corner the printer starts from.
+fn local_to_screen(rect: Rect, rotation: i32, u: f32, v: f32) -> Pos2 {
+    match rotation {
+        90 => Pos2::new(rect.max.x - v, rect.min.y + u),
+        180 => Pos2::new(rect.max.x - u, rect.max.y - v),
+        270 => Pos2::new(rect.min.x + v, rect.max.y - u),
+        _ => Pos2::new(rect.min.x + u, rect.min.y + v),
+    }
+}
+
+fn paint_text(painter: &egui::Painter, rect: Rect, rotation: i32, text: &str, font: egui::FontId, color: Color32, bold: bool) {
+    let galley = painter.layout_no_wrap(text.replace('\n', " "), font, color);
+    let pos = local_to_screen(rect, rotation, 0.0, 0.0);
+    let angle = (rotation as f32).to_radians();
+    painter.add(TextShape::new(pos, galley.clone(), color).with_angle(angle));
+    if bold {
+        // The bundled fonts have no bold face, so match the printer's double strike
+        let shifted = pos + Vec2::new(0.7, 0.0);
+        painter.add(TextShape::new(shifted, galley, color).with_angle(angle));
+    }
 }
 
 pub struct CanvasState {
@@ -154,7 +177,7 @@ impl CanvasState {
                     let s_color = Color32::from_rgba_premultiplied(
                         stroke_color[0], stroke_color[1], stroke_color[2], stroke_color[3],
                     );
-                    let s_width = (*stroke_width * self.zoom * 0.4).max(0.8);
+                    let s_width = (*stroke_width * self.zoom).max(0.8);
                     let stroke = Stroke::new(s_width, s_color);
 
                     let f_color = fill_color.map(|c| {
@@ -171,37 +194,37 @@ impl CanvasState {
                             painter.rect(el_rect, c_rad, f_color, stroke);
                         }
                         ShapeKind::Line => {
-                            painter.line_segment(
+                            let segment = if el.rotation == 90 || el.rotation == 270 {
+                                [Pos2::new(el_rect.center().x, el_rect.min.y),
+                                 Pos2::new(el_rect.center().x, el_rect.max.y)]
+                            } else {
                                 [Pos2::new(el_rect.min.x, el_rect.center().y),
-                                 Pos2::new(el_rect.max.x, el_rect.center().y)],
-                                stroke,
-                            );
+                                 Pos2::new(el_rect.max.x, el_rect.center().y)]
+                            };
+                            painter.line_segment(segment, stroke);
                         }
                         ShapeKind::Ellipse => {
-                            painter.circle(el_rect.center(), el_rect.width().min(el_rect.height()) / 2.0, f_color, stroke);
+                            let radius = el_rect.size() / 2.0;
+                            painter.add(Shape::ellipse_filled(el_rect.center(), radius, f_color));
+                            painter.add(Shape::ellipse_stroke(el_rect.center(), radius, stroke));
                         }
                     }
                 }
                 ElementData::Text { text, font_size, bold, italic: _, color } => {
                     let t_color = Color32::from_rgba_premultiplied(color[0], color[1], color[2], color[3]);
                     let scale_size = (*font_size * self.zoom * 0.35).max(8.0);
-                    let font_id = egui::FontId {
-                        size: scale_size,
-                        family: if *bold { egui::FontFamily::Proportional } else { egui::FontFamily::Proportional },
-                    };
-                    painter.text(
-                        el_rect.min,
-                        egui::Align2::LEFT_TOP,
-                        text,
-                        font_id,
-                        t_color,
-                    );
+                    paint_text(&painter, el_rect, el.rotation, text, egui::FontId::proportional(scale_size), t_color, *bold);
                 }
                 ElementData::Barcode { barcode_type, data, show_text, .. } => {
+                    let dpmm = label.resolution.dots_per_mm();
+                    let w_dots = (el.width * dpmm).round().max(1.0) as u32;
+                    let h_dots = (el.height * dpmm).round().max(1.0) as u32;
+                    let dot = self.zoom / dpmm;
+
                     if barcode_type.is_2d() {
-                        // Render QR Code
+                        // Render QR Code at the size it prints
                         if let Some((grid_w, colors)) = generate_qr_matrix(data) {
-                            let mod_size = el_rect.width() / (grid_w as f32);
+                            let mod_size = qr_scale(data, w_dots.min(h_dots)) as f32 * dot;
                             for row in 0..grid_w {
                                 for col in 0..grid_w {
                                     if colors[row * grid_w + col] {
@@ -217,23 +240,23 @@ impl CanvasState {
                             }
                         }
                     } else {
-                        // Render 1D Barcode (Code 128 / Code 39)
+                        // Render 1D Barcode (Code 128 / Code 39) at the size it prints
                         let pattern = match barcode_type {
                             BarcodeType::Code39 => generate_code39(data),
                             _ => generate_code128(data),
                         };
 
-                        let bar_area_h = if *show_text { el_rect.height() * 0.8 } else { el_rect.height() };
-                        let total_modules = pattern.modules.len().max(1);
-                        let mod_w = el_rect.width() / (total_modules as f32);
+                        let (along, across) = along_across(el.rotation, w_dots, h_dots);
+                        let mod_w = bar_dots(pattern.modules.len(), along) as f32 * dot;
+                        let bar_h = bar_height_dots(across, *show_text) as f32 * dot;
 
                         for (idx, &is_bar) in pattern.modules.iter().enumerate() {
                             if is_bar {
-                                let bar_x = el_rect.min.x + idx as f32 * mod_w;
+                                let u = idx as f32 * mod_w;
                                 painter.rect_filled(
-                                    Rect::from_min_size(
-                                        Pos2::new(bar_x, el_rect.min.y),
-                                        Vec2::new(mod_w.max(1.0), bar_area_h),
+                                    Rect::from_two_pos(
+                                        local_to_screen(el_rect, el.rotation, u, 0.0),
+                                        local_to_screen(el_rect, el.rotation, u + mod_w.max(1.0), bar_h),
                                     ),
                                     0.0,
                                     Color32::BLACK,
@@ -242,44 +265,25 @@ impl CanvasState {
                         }
 
                         if *show_text {
-                            let txt_pos = Pos2::new(el_rect.center().x, el_rect.min.y + bar_area_h + 2.0);
-                            painter.text(
-                                txt_pos,
-                                egui::Align2::CENTER_TOP,
-                                data,
-                                egui::FontId::monospace((self.zoom * 2.8).max(9.0)),
-                                Color32::BLACK,
-                            );
+                            let font = egui::FontId::monospace((self.zoom * 2.8).max(9.0));
+                            let galley = painter.layout_no_wrap(data.clone(), font, Color32::BLACK);
+                            let code_len = pattern.modules.len() as f32 * mod_w;
+                            let u = ((code_len - galley.size().x) / 2.0).max(0.0);
+                            let pos = local_to_screen(el_rect, el.rotation, u, bar_h + 2.0);
+                            let angle = (el.rotation as f32).to_radians();
+                            painter.add(TextShape::new(pos, galley, Color32::BLACK).with_angle(angle));
                         }
                     }
                 }
                 ElementData::Counter { prefix, current_value, padding_digits, font_size, bold, .. } => {
-                    let formatted = format!("{}{:0width$}", prefix, current_value, width = padding_digits);
+                    let formatted = counter_text(prefix, *current_value, *padding_digits);
                     let scale_size = (*font_size * self.zoom * 0.35).max(8.0);
-                    painter.text(
-                        el_rect.min,
-                        egui::Align2::LEFT_TOP,
-                        &formatted,
-                        egui::FontId {
-                            size: scale_size,
-                            family: if *bold { egui::FontFamily::Monospace } else { egui::FontFamily::Monospace },
-                        },
-                        Color32::BLACK,
-                    );
+                    paint_text(&painter, el_rect, el.rotation, &formatted, egui::FontId::monospace(scale_size), Color32::BLACK, *bold);
                 }
-                ElementData::DateTime { format_str: _, font_size, bold } => {
-                    let date_str = "2026-11-06 12:30";
+                ElementData::DateTime { format_str, font_size, bold } => {
+                    let date_str = format_datetime(format_str);
                     let scale_size = (*font_size * self.zoom * 0.35).max(8.0);
-                    painter.text(
-                        el_rect.min,
-                        egui::Align2::LEFT_TOP,
-                        date_str,
-                        egui::FontId {
-                            size: scale_size,
-                            family: if *bold { egui::FontFamily::Monospace } else { egui::FontFamily::Proportional },
-                        },
-                        Color32::from_rgb(40, 40, 40),
-                    );
+                    paint_text(&painter, el_rect, el.rotation, &date_str, egui::FontId::proportional(scale_size), Color32::from_rgb(40, 40, 40), *bold);
                 }
             }
 

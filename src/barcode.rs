@@ -19,66 +19,48 @@ pub fn generate_qr_matrix(data: &str) -> Option<(usize, Vec<bool>)> {
     }
 }
 
-// Code 39 patterns (5 bars, 4 spaces: 1 = wide (2 modules), 0 = narrow (1 module))
-// Representation: 9 bits [bar, space, bar, space, bar, space, bar, space, bar]
-fn code39_char_pattern(c: char) -> Option<[u8; 9]> {
-    match c.to_ascii_uppercase() {
-        '1' => Some([1, 0, 0, 0, 0, 0, 0, 0, 1]), // W-N-N-N-N-N-N-N-W
-        '2' => Some([0, 0, 1, 0, 0, 0, 0, 0, 1]),
-        '3' => Some([1, 0, 1, 0, 0, 0, 0, 0, 0]),
-        '4' => Some([0, 0, 0, 0, 1, 0, 0, 0, 1]),
-        '5' => Some([1, 0, 0, 0, 1, 0, 0, 0, 0]),
-        '6' => Some([0, 0, 1, 0, 1, 0, 0, 0, 0]),
-        '7' => Some([0, 0, 0, 0, 0, 0, 1, 0, 1]),
-        '8' => Some([1, 0, 0, 0, 0, 0, 1, 0, 0]),
-        '9' => Some([0, 0, 1, 0, 0, 0, 1, 0, 0]),
-        '0' => Some([0, 0, 0, 0, 1, 0, 1, 0, 0]),
-        'A' => Some([1, 0, 0, 0, 0, 0, 0, 1, 1]),
-        'B' => Some([0, 0, 1, 0, 0, 0, 0, 1, 1]),
-        'C' => Some([1, 0, 1, 0, 0, 0, 0, 1, 0]),
-        'D' => Some([0, 0, 0, 0, 1, 0, 0, 1, 1]),
-        'E' => Some([1, 0, 0, 0, 1, 0, 0, 1, 0]),
-        'F' => Some([0, 0, 1, 0, 1, 0, 0, 1, 0]),
-        'G' => Some([0, 0, 0, 0, 0, 0, 1, 1, 1]),
-        'H' => Some([1, 0, 0, 0, 0, 0, 1, 1, 0]),
-        'I' => Some([0, 0, 1, 0, 0, 0, 1, 1, 0]),
-        'J' => Some([0, 0, 0, 0, 1, 0, 1, 1, 0]),
-        'K' => Some([1, 0, 0, 0, 0, 1, 0, 0, 1]),
-        'L' => Some([0, 0, 1, 0, 0, 1, 0, 0, 1]),
-        'M' => Some([1, 0, 1, 0, 0, 1, 0, 0, 0]),
-        'N' => Some([0, 0, 0, 0, 1, 1, 0, 0, 1]),
-        'O' => Some([1, 0, 0, 0, 1, 1, 0, 0, 0]),
-        'P' => Some([0, 0, 1, 0, 1, 1, 0, 0, 0]),
-        'Q' => Some([0, 0, 0, 0, 0, 1, 1, 0, 1]),
-        'R' => Some([1, 0, 0, 0, 0, 1, 1, 0, 0]),
-        'S' => Some([0, 0, 1, 0, 0, 1, 1, 0, 0]),
-        'T' => Some([0, 0, 0, 0, 1, 1, 1, 0, 0]),
-        'U' => Some([1, 1, 0, 0, 0, 0, 0, 0, 1]),
-        'V' => Some([0, 1, 1, 0, 0, 0, 0, 0, 1]),
-        'W' => Some([1, 1, 1, 0, 0, 0, 0, 0, 0]),
-        'X' => Some([0, 1, 0, 0, 1, 0, 0, 0, 1]),
-        'Y' => Some([1, 1, 0, 0, 1, 0, 0, 0, 0]),
-        'Z' => Some([0, 1, 1, 0, 1, 0, 0, 0, 0]),
-        '-' => Some([0, 1, 0, 0, 0, 0, 1, 0, 1]),
-        '.' => Some([1, 1, 0, 0, 0, 0, 1, 0, 0]),
-        ' ' => Some([0, 1, 1, 0, 0, 0, 1, 0, 0]),
-        '*' => Some([0, 1, 0, 0, 1, 0, 1, 0, 0]), // Start/stop delimiter
-        '$' => Some([0, 1, 0, 1, 0, 1, 0, 0, 0]),
-        '/' => Some([0, 1, 0, 1, 0, 0, 0, 1, 0]),
-        '+' => Some([0, 1, 0, 0, 0, 1, 0, 1, 0]),
-        '%' => Some([0, 0, 0, 1, 0, 1, 0, 1, 0]),
-        _ => None,
-    }
+/// Narrowest-bar width in dots that fits `module_count` modules along the box.
+pub fn bar_dots(module_count: usize, along_dots: u32) -> u32 {
+    (along_dots / module_count.max(1) as u32).clamp(1, 10)
+}
+
+/// Bar height in dots; the human-readable line takes the rest of the box.
+pub fn bar_height_dots(across_dots: u32, show_text: bool) -> u32 {
+    let height = if show_text { across_dots * 4 / 5 } else { across_dots };
+    height.max(1)
+}
+
+/// Dots per QR module that fit the box.
+pub fn qr_scale(data: &str, box_dots: u32) -> u32 {
+    let modules = generate_qr_matrix(data).map_or(21, |(width, _)| width as u32);
+    (box_dots / modules).clamp(1, 10)
+}
+
+// Code 39 patterns: 5 bars and 4 spaces in order, n = narrow, w = wide (3 modules)
+fn code39_char_pattern(c: char) -> Option<&'static str> {
+    Some(match c.to_ascii_uppercase() {
+        '0' => "nnnwwnwnn", '1' => "wnnwnnnnw", '2' => "nnwwnnnnw", '3' => "wnwwnnnnn",
+        '4' => "nnnwwnnnw", '5' => "wnnwwnnnn", '6' => "nnwwwnnnn", '7' => "nnnwnnwnw",
+        '8' => "wnnwnnwnn", '9' => "nnwwnnwnn", 'A' => "wnnnnwnnw", 'B' => "nnwnnwnnw",
+        'C' => "wnwnnwnnn", 'D' => "nnnnwwnnw", 'E' => "wnnnwwnnn", 'F' => "nnwnwwnnn",
+        'G' => "nnnnnwwnw", 'H' => "wnnnnwwnn", 'I' => "nnwnnwwnn", 'J' => "nnnnwwwnn",
+        'K' => "wnnnnnnww", 'L' => "nnwnnnnww", 'M' => "wnwnnnnwn", 'N' => "nnnnwnnww",
+        'O' => "wnnnwnnwn", 'P' => "nnwnwnnwn", 'Q' => "nnnnnnwww", 'R' => "wnnnnnwwn",
+        'S' => "nnwnnnwwn", 'T' => "nnnnwnwwn", 'U' => "wwnnnnnnw", 'V' => "nwwnnnnnw",
+        'W' => "wwwnnnnnn", 'X' => "nwnnwnnnw", 'Y' => "wwnnwnnnn", 'Z' => "nwwnwnnnn",
+        '-' => "nwnnnnwnw", '.' => "wwnnnnwnn", ' ' => "nwwnnnwnn", '*' => "nwnnwnwnn",
+        '$' => "nwnwnwnnn", '/' => "nwnwnnnwn", '+' => "nwnnnwnwn", '%' => "nnnwnwnwn",
+        _ => return None,
+    })
+}
+
+pub fn is_code39_char(c: char) -> bool {
+    c != '*' && code39_char_pattern(c).is_some()
 }
 
 pub fn generate_code39(text: &str) -> BarPattern {
     let mut modules = Vec::new();
     let content = format!("*{}*", text.trim_matches('*'));
-
-    // Leading quiet zone
-    for _ in 0..10 {
-        modules.push(false);
-    }
 
     for (char_idx, ch) in content.chars().enumerate() {
         if char_idx > 0 {
@@ -86,24 +68,14 @@ pub fn generate_code39(text: &str) -> BarPattern {
             modules.push(false);
         }
         if let Some(pattern) = code39_char_pattern(ch) {
-            for (idx, &is_wide) in pattern.iter().enumerate() {
+            for (idx, element) in pattern.chars().enumerate() {
                 let is_bar = idx % 2 == 0;
-                let count = if is_wide == 1 { 3 } else { 1 };
+                let count = if element == 'w' { 3 } else { 1 };
                 for _ in 0..count {
                     modules.push(is_bar);
                 }
             }
-        } else {
-            // Fallback for unencodable char
-            for _ in 0..9 {
-                modules.push(false);
-            }
         }
-    }
-
-    // Trailing quiet zone
-    for _ in 0..10 {
-        modules.push(false);
     }
 
     BarPattern { modules }
@@ -242,11 +214,6 @@ pub fn generate_code128(text: &str) -> BarPattern {
     symbols.push(checksum_val);
     symbols.push(106); // Stop symbol
 
-    // Leading quiet zone (10 modules)
-    for _ in 0..10 {
-        modules.push(false);
-    }
-
     for (i, &sym) in symbols.iter().enumerate() {
         let widths = CODE128_PATTERNS[sym];
         for (idx, &w) in widths.iter().enumerate() {
@@ -262,10 +229,44 @@ pub fn generate_code128(text: &str) -> BarPattern {
         }
     }
 
-    // Trailing quiet zone
-    for _ in 0..10 {
-        modules.push(false);
+    BarPattern { modules }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_code39_character_has_three_wide_elements() {
+        let alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-. *";
+        let mut seen = std::collections::HashSet::new();
+        for c in alphabet.chars() {
+            let pattern = code39_char_pattern(c).unwrap();
+            assert_eq!(pattern.len(), 9, "{c}");
+            assert_eq!(pattern.matches('w').count(), 3, "{c}");
+            assert!(seen.insert(pattern), "duplicate pattern for {c}");
+        }
     }
 
-    BarPattern { modules }
+    #[test]
+    fn code39_has_expected_length() {
+        // 3 characters with start/stop: 5 symbols of 15 modules plus 4 gaps
+        assert_eq!(generate_code39("A1Z").modules.len(), 5 * 15 + 4);
+    }
+
+    #[test]
+    fn code128_has_expected_length_without_quiet_zone() {
+        // start + 2 chars + check, 11 modules each, plus 13-module stop
+        let pattern = generate_code128("AB");
+        assert_eq!(pattern.modules.len(), 4 * 11 + 13);
+        assert!(pattern.modules[0]);
+        assert!(*pattern.modules.last().unwrap());
+    }
+
+    #[test]
+    fn bar_width_fits_box_and_never_reaches_zero() {
+        assert_eq!(bar_dots(101, 320), 3);
+        assert_eq!(bar_dots(1000, 320), 1);
+        assert_eq!(bar_dots(10, 320), 10);
+    }
 }

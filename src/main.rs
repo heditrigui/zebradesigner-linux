@@ -194,20 +194,11 @@ impl eframe::App for ZebraDesignerApp {
                                     });
 
                                 let p = &self.ui_state.usb_printers[cur];
-                                ui.label(format!("Device: {} | Status: Ready", p.device_node));
+                                ui.label(format!("Device: {} | Status: {}", p.device_node, p.status));
                             }
 
                             ui.add_space(6.0);
-                            ui.horizontal(|ui| {
-                                ui.label("Protocol:");
-                                egui::ComboBox::from_id_salt("modal_lang_sel")
-                                    .selected_text(self.ui_state.printer_language.name())
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(&mut self.ui_state.printer_language, printer::PrinterLanguage::Auto, "Auto (EPL2 for 2844)");
-                                        ui.selectable_value(&mut self.ui_state.printer_language, printer::PrinterLanguage::Epl2, "EPL2 (Eltron)");
-                                        ui.selectable_value(&mut self.ui_state.printer_language, printer::PrinterLanguage::Zpl2, "ZPL II (Zebra)");
-                                    });
-                            });
+                            ui_panels::protocol_combo(ui, "modal_lang_sel", &mut self.ui_state.printer_language);
 
                             ui.horizontal(|ui| {
                                 ui.label("Copies:");
@@ -238,6 +229,7 @@ impl eframe::App for ZebraDesignerApp {
                                 ui.add(egui::DragValue::new(&mut self.ui_state.print_copies).range(1..=500));
                                 ui.end_row();
                             });
+                            ui_panels::protocol_combo(ui, "modal_net_lang_sel", &mut self.ui_state.printer_language);
                             ui.add_space(8.0);
                             ui.horizontal(|ui| {
                                 if ui.button("🖨 Print Network").clicked() {
@@ -258,28 +250,24 @@ impl eframe::App for ZebraDesignerApp {
             if do_print_usb {
                 if !self.ui_state.usb_printers.is_empty() {
                     let sel = self.ui_state.selected_usb_printer.min(self.ui_state.usb_printers.len() - 1);
-                    let p = &self.ui_state.usb_printers[sel];
-                    match printer::print_to_usb(p, &self.label, self.ui_state.print_copies, self.ui_state.printer_language) {
-                        Ok(msg) => {
-                            self.ui_state.status_message = msg.clone();
-                            self.ui_state.print_notification = Some((true, msg));
-                        }
-                        Err(e) => {
-                            self.ui_state.status_message = format!("USB error: {}", e);
-                            self.ui_state.print_notification = Some((false, format!("Print failed: {}", e)));
-                        }
-                    }
+                    let result = printer::print_to_usb(
+                        &self.ui_state.usb_printers[sel],
+                        &mut self.label,
+                        self.ui_state.print_copies,
+                        self.ui_state.printer_language,
+                    );
+                    self.ui_state.report_print(result);
                 }
                 self.ui_state.show_print_dialog = false;
             } else if do_print_net {
-                let zpl = zpl::generate_zpl(&self.label);
-                let _ = std::fs::write("last_print.zpl", zpl);
-                let msg = format!(
-                    "Print job sent ({} copies) to {}:{}",
-                    self.ui_state.print_copies, self.ui_state.printer_ip, self.ui_state.printer_port
+                let result = printer::print_to_network(
+                    &self.ui_state.printer_ip,
+                    self.ui_state.printer_port,
+                    &mut self.label,
+                    self.ui_state.print_copies,
+                    self.ui_state.printer_language,
                 );
-                self.ui_state.status_message = msg.clone();
-                self.ui_state.print_notification = Some((true, msg));
+                self.ui_state.report_print(result);
                 self.ui_state.show_print_dialog = false;
             } else if !open || close_dialog {
                 self.ui_state.show_print_dialog = false;

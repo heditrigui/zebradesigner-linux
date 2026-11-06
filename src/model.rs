@@ -1,5 +1,35 @@
 use serde::{Deserialize, Serialize};
 
+/// Text for a counter value, e.g. `SN-001042`.
+pub fn counter_text(prefix: &str, value: i64, padding_digits: usize) -> String {
+    format!("{}{:0width$}", prefix, value, width = padding_digits)
+}
+
+/// Current local time in a strftime format; an invalid format is shown as typed.
+pub fn format_datetime(format_str: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match write!(out, "{}", chrono::Local::now().format(format_str)) {
+        Ok(()) => out,
+        Err(_) => format_str.to_string(),
+    }
+}
+
+/// Thermal printers are one-colour: dark colours print, light ones stay paper white.
+pub fn prints_black(color: [u8; 4]) -> bool {
+    let luminance = 0.299 * color[0] as f32 + 0.587 * color[1] as f32 + 0.114 * color[2] as f32;
+    color[3] >= 128 && luminance < 128.0
+}
+
+/// Splits an element box into (length along the reading direction, length across it).
+pub fn along_across<T: Copy>(rotation: i32, width: T, height: T) -> (T, T) {
+    if rotation == 90 || rotation == 270 {
+        (height, width)
+    } else {
+        (width, height)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Unit {
     Mm,
@@ -172,6 +202,19 @@ impl Label {
             margin_bottom_mm: 2.0,
             elements: Vec::new(),
             next_element_id: 1,
+        }
+    }
+
+    pub fn has_counters(&self) -> bool {
+        self.elements.iter().any(|e| matches!(e.data, ElementData::Counter { .. }))
+    }
+
+    /// Moves every counter past the labels that were just printed.
+    pub fn advance_counters(&mut self, copies: u32) {
+        for el in &mut self.elements {
+            if let ElementData::Counter { current_value, step, .. } = &mut el.data {
+                *current_value += *step * copies.max(1) as i64;
+            }
         }
     }
 

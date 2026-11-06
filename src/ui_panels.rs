@@ -1,6 +1,6 @@
 use crate::canvas::CanvasState;
 use crate::model::{BarcodeType, Element, ElementData, Label, Orientation, Resolution, ShapeKind};
-use crate::printer::{detect_usb_printers, print_to_usb, PrinterLanguage, UsbPrinter};
+use crate::printer::{detect_usb_printers, print_to_network, print_to_usb, PrinterLanguage, UsbPrinter};
 use crate::zpl::generate_zpl;
 use eframe::egui::{self, Color32, RichText, Vec2};
 
@@ -34,6 +34,36 @@ pub struct UiState {
     pub printer_language: PrinterLanguage,
 }
 
+impl UiState {
+    /// Shows the outcome of a print job in the status bar and banner.
+    pub fn report_print(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(msg) => {
+                self.status_message = msg.clone();
+                self.print_notification = Some((true, msg));
+            }
+            Err(err) => {
+                self.status_message = format!("Print error: {}", err);
+                self.print_notification = Some((false, format!("Print failed: {}", err)));
+            }
+        }
+    }
+}
+
+/// Printer language picker shared by the print dialog and the print tab.
+pub fn protocol_combo(ui: &mut egui::Ui, id: &str, language: &mut PrinterLanguage) {
+    ui.horizontal(|ui| {
+        ui.label("Protocol:");
+        egui::ComboBox::from_id_salt(id)
+            .selected_text(language.name())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(language, PrinterLanguage::Auto, "Auto (EPL2 for 2844)");
+                ui.selectable_value(language, PrinterLanguage::Epl2, "EPL2 (Eltron)");
+                ui.selectable_value(language, PrinterLanguage::Zpl2, "ZPL II (Zebra)");
+            });
+    });
+}
+
 impl Default for UiState {
     fn default() -> Self {
         let usb_printers = detect_usb_printers();
@@ -54,7 +84,9 @@ impl Default for UiState {
             usb_printers,
             selected_usb_printer: 0,
             print_mode: PrintTargetMode::Usb,
-            nlbl_import_path: "/home/heditrigui/Downloads/Label.nlbl".to_string(),
+            nlbl_import_path: std::env::var("HOME")
+                .map(|home| format!("{}/Downloads/Label.nlbl", home))
+                .unwrap_or_default(),
             print_notification: None,
             printer_language: PrinterLanguage::Auto,
         }
@@ -117,7 +149,7 @@ pub fn render_menu_bar(
                 }
                 ui.separator();
                 if ui.button("📤 Export ZPL Code (.zpl)").clicked() {
-                    let zpl = generate_zpl(label);
+                    let zpl = generate_zpl(label, ui_state.print_copies);
                     let _ = std::fs::write("output_label.zpl", zpl);
                     ui_state.status_message = "Exported ZPL code to output_label.zpl".to_string();
                     ui_state.active_tab = ActiveTab::ZplCode;
@@ -352,7 +384,7 @@ pub fn render_toolbar(
                     ui_state.status_message = "Project saved.".to_string();
                 }
             }
-            if ui.button("📥 Import .nlbl").on_hover_text("Import NiceLabel / ZebraDesigner .nlbl template (/home/heditrigui/Downloads/Label.nlbl)").clicked() {
+            if ui.button("📥 Import .nlbl").on_hover_text("Import the NiceLabel / ZebraDesigner .nlbl template set in Label Setup").clicked() {
                 let path = std::path::Path::new(&ui_state.nlbl_import_path);
                 match crate::nlbl::import_nlbl(path) {
                     Ok(imported) => {
@@ -743,7 +775,7 @@ fn render_properties_tab(
                         ui.checkbox(italic, "Italic");
                     });
                 }
-                ElementData::Barcode { barcode_type, data, show_text, module_width } => {
+                ElementData::Barcode { barcode_type, data, show_text, .. } => {
                     ui.label(RichText::new("Barcode Settings").strong());
                     ui.add_space(4.0);
 
@@ -765,10 +797,7 @@ fn render_properties_tab(
                         ui.checkbox(show_text, "Show Human-Readable Text Below");
                     }
 
-                    ui.horizontal(|ui| {
-                        ui.label("Narrow Bar Ratio:");
-                        ui.add(egui::DragValue::new(module_width).speed(0.05).range(0.2..=2.0));
-                    });
+                    ui.label(RichText::new("Bar width is set automatically to fit the box.").color(Color32::from_rgb(120, 130, 145)));
                 }
                 ElementData::Shape { kind, stroke_width, corner_radius, .. } => {
                     ui.label(RichText::new("Shape Properties").strong());
@@ -1003,11 +1032,13 @@ fn render_zpl_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiState) {
         }
     };
 
+    // One copy is enough to inspect; the real job is built when printing
     let code = if use_epl {
-        crate::epl::generate_epl(label, ui_state.print_copies)
+        crate::epl::generate_epl(label, 1)
     } else {
-        generate_zpl(label)
+        generate_zpl(label, 1)
     };
+    ui.label("Showing one copy.");
 
     let ext = if use_epl { "epl" } else { "zpl" };
 
@@ -1038,7 +1069,7 @@ fn render_zpl_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiState) {
     });
 }
 
-fn render_batch_print_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiState) {
+fn render_batch_print_tab(ui: &mut egui::Ui, label: &mut Label, ui_state: &mut UiState) {
     ui.heading(RichText::new("Print Label").size(15.0));
     ui.add_space(4.0);
 
@@ -1107,7 +1138,7 @@ fn render_batch_print_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiSta
                     }
 
                     ui.label("Connection Status:");
-                    ui.colored_label(Color32::from_rgb(0, 150, 40), "● Connected & Ready");
+                    ui.colored_label(Color32::from_rgb(0, 150, 40), format!("● {}", p.status));
                     ui.end_row();
                 });
             }
@@ -1115,16 +1146,7 @@ fn render_batch_print_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiSta
             ui.add_space(10.0);
             ui.separator();
 
-            ui.horizontal(|ui| {
-                ui.label("Protocol:");
-                egui::ComboBox::from_id_salt("usb_lang_sel")
-                    .selected_text(ui_state.printer_language.name())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut ui_state.printer_language, PrinterLanguage::Auto, "Auto (EPL2 for 2844)");
-                        ui.selectable_value(&mut ui_state.printer_language, PrinterLanguage::Epl2, "EPL2 (Eltron)");
-                        ui.selectable_value(&mut ui_state.printer_language, PrinterLanguage::Zpl2, "ZPL II (Zebra)");
-                    });
-            });
+            protocol_combo(ui, "usb_lang_sel", &mut ui_state.printer_language);
 
             ui.horizontal(|ui| {
                 ui.label("Number of Copies:");
@@ -1135,17 +1157,8 @@ fn render_batch_print_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiSta
             if ui.button(RichText::new("🖨 Print Directly to USB Printer").size(14.0).strong()).clicked() {
                 if !ui_state.usb_printers.is_empty() {
                     let sel = ui_state.selected_usb_printer.min(ui_state.usb_printers.len() - 1);
-                    let p = &ui_state.usb_printers[sel];
-                    match print_to_usb(p, label, ui_state.print_copies, ui_state.printer_language) {
-                        Ok(msg) => {
-                            ui_state.status_message = msg.clone();
-                            ui_state.print_notification = Some((true, msg));
-                        }
-                        Err(err) => {
-                            ui_state.status_message = format!("USB error: {}", err);
-                            ui_state.print_notification = Some((false, format!("Print failed: {}", err)));
-                        }
-                    }
+                    let result = print_to_usb(&ui_state.usb_printers[sel], label, ui_state.print_copies, ui_state.printer_language);
+                    ui_state.report_print(result);
                 } else {
                     ui_state.status_message = "Cannot print: no USB printer connected.".to_string();
                     ui_state.print_notification = Some((false, "Cannot print: no USB printer connected.".to_string()));
@@ -1167,13 +1180,14 @@ fn render_batch_print_tab(ui: &mut egui::Ui, label: &Label, ui_state: &mut UiSta
                 ui.end_row();
             });
 
+            protocol_combo(ui, "net_lang_sel", &mut ui_state.printer_language);
+
             ui.add_space(10.0);
             ui.separator();
 
             if ui.button(RichText::new("🖨 Send to Network Printer (TCP Raw 9100)").strong()).clicked() {
-                let zpl = generate_zpl(label);
-                let _ = std::fs::write("print_job.zpl", &zpl);
-                ui_state.status_message = format!("Print job ({} copies) generated and ready for {}", ui_state.print_copies, ui_state.printer_ip);
+                let result = print_to_network(&ui_state.printer_ip, ui_state.printer_port, label, ui_state.print_copies, ui_state.printer_language);
+                ui_state.report_print(result);
             }
         }
     }
